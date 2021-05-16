@@ -13,6 +13,14 @@
 #include <errno.h>
 #include <unistd.h>
 
+#define	MAXBUF	(25*BUFSIZ)
+
+struct buf
+  {
+    int		max, pos;
+    char	buf[0];
+  };
+
 static void
 OOPS(int err, const char *s, ...)
 {
@@ -25,6 +33,19 @@ OOPS(int err, const char *s, ...)
     fprintf(stderr, ": %s", strerror(errno));
   fprintf(stderr, "\n");
   exit(err);
+}
+
+static struct buf *
+buf_alloc(int len)
+{
+  struct buf	*buf;
+
+  buf	= malloc(len + sizeof *buf);
+  if (!buf)
+    OOPS(23, "out of memory");
+  buf->max	= len;
+  buf->pos	= 0;
+  return buf;
 }
 
 static void
@@ -57,23 +78,29 @@ writer(const char *buf, int len)
 }
 
 static int
-bashnul(void (*fn)(char *, int))
+bashnul(void (*fn)(struct buf *, struct buf *, int), int rlen)
 {
-  char	buf[10*BUFSIZ];
+  struct buf	*rbuf, *wbuf;
   int	loop;
+
+  rbuf	= buf_alloc(rlen);		/* small or big	*/
+  wbuf	= buf_alloc(MAXBUF*2);		/* always big	*/
 
   for (loop=0; ++loop<1000; )
     {
       int	got;
 
-      got	= read(0, buf, sizeof buf);
+      got	= read(0, rbuf->buf+rbuf->pos, (size_t)(rbuf->max-rbuf->pos));
       if (got<0)
         {
           if (errno == EAGAIN || errno==EINTR)
             continue;
           OOPS(23, "read failed");
         }
-      fn(buf, got);
+      rbuf->pos	+= got;
+      fn(rbuf, wbuf, got);
+      writer(wbuf->buf, wbuf->pos);
+      wbuf->pos	= 0;
       if (!got)
         return 0;
       loop	= 0;
@@ -83,61 +110,73 @@ bashnul(void (*fn)(char *, int))
 }
 
 static void
-encode(char *buf, int len)
+encode(struct buf *rbuf, struct buf *wbuf, int ign)
 {
-  char *pos;
+  char	*r = rbuf->buf;
+  char	*w = wbuf->buf+wbuf->pos;
+  int	len;
 
-  for (pos=buf; len; pos++, len--)
-    switch (*pos)
+  if (wbuf->max - wbuf->pos < rbuf->pos*2)
+    OOPS(23, "internal error, write buffer size too small");
+  /* we know here, that rbuf fits into wbuf	*/
+  for (len = rbuf->pos; len; r++, len--)
+    switch (*r)
       {
-      char	c;
-      int	n;
-
       case 0:	/* 00 => 01 02	*/
       case 1:	/* 01 => 01 03	*/
-        c	= *pos;
-        *pos	= 1;
-        n	= pos-buf+1;
-        writer(buf, n);
-        buf	= pos;
-        *pos	= c+2;
+        *w++	= 1;
+        *w++	= *r+2;
+        break;
+
+      default:
+        *w++ = *r;
         break;
       }
-  writer(buf, pos-buf);
+  wbuf->pos	= w-wbuf->buf;
+  rbuf->pos	= 0;
 }
 
 static void
-decode(char *buf, int len)
+decode(struct buf *rbuf, struct buf *wbuf, int more)
 {
-  static int	dangling;
-  char		*pos;
+  char	*r = rbuf->buf;
+  char	*w = wbuf->buf+wbuf->pos;
+  int	len;
 
-  if (!len && dangling)
-    OOPS(23, "stream ended with 01, expected at least 1 byte to follow");
-  for (pos=buf; len; pos++, len--)
-    if (dangling)
-      switch (*pos)
-        {
-        default:
-          OOPS(23, "encountered unknown 01 %02x sequence, only 01 02 or 01 03 are valid!", (unsigned char)*pos);
-        case 2:
-        case 3:
-          *pos		-= 2;
-          dangling	= 0;
-          break;
-        }
-    else
-      switch (*pos)
+  if (wbuf->max - wbuf->pos < rbuf->pos)
+    OOPS(23, "internal error, write buffer size too small");
+  /* we know here, that rbuf fits into wbuf	*/
+  for (len = rbuf->pos; len; r++, len--)
+    {
+      switch (*r)
         {
         case 0:
           OOPS(23, "encountered NUL, should have been escaped to 01 02");
+        default:
+          *w++	= *r;
+          continue;
+
         case 1:
-          writer(buf, pos-buf);
-          buf		= pos+1;
-          dangling	= 1;
           break;
         }
-  writer(buf, pos-buf);
+      if (--len)
+        switch (*++r)
+          {
+          default:
+            OOPS(23, "encountered unknown 01 %02x sequence, only 01 02 or 01 03 are valid!", (unsigned char)*r);
+          case 2:
+          case 3:
+            *w++	= *r-2;
+            continue;
+          }
+      rbuf->buf[0]	= *r;	/* ==1	*/
+      len		= 1;
+      break;
+    }
+  wbuf->pos	= w-wbuf->buf;
+  rbuf->pos	= len;	/* 0 or 1	*/
+  if (len && !more)
+    OOPS(23, "stream ended with 01, expected at least 1 byte to follow");
 }
 
 int
@@ -157,6 +196,6 @@ main(int argc, char **argv)
   if (!lc || strcmp(lc, "C"))
     OOPS(23, "please set LC_ALL=C");
 
-  return bashnul(arg=='e' ? encode : decode);
+  return arg=='e' ? bashnul(encode, MAXBUF) : bashnul(decode, MAXBUF*2);
 }
 
