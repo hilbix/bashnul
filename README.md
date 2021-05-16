@@ -1,3 +1,5 @@
+[![bashnul Build Status](https://api.cirrus-ci.com/github/hilbix/bashnul.svg)](https://cirrus-ci.com/github/hilbix/bashnul/master)
+
 # BashNUL
 
 escape and de-escape NUL characters.
